@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import re
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 import ssl
 import time
 
@@ -1371,9 +1371,57 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         adapter._client = adapter._build_lark_client(domain)
         metadata = {"thread_id": thread_id} if thread_id else None
 
+        # ------------------------------------------------------------------ #
+        # FIX: Standalone cron delivery to `oc_` P2P chats.
+        #
+        # The Lark API's `message.create` with `receive_id_type=chat_id` works
+        # for the bot's own P2P DM with the user (replying to a received event)
+        # but FAILS to push the message to the user's Feishu client when the
+        # bot app isn't in the chat's member list — which is the case for `oc_`
+        # P2P chats queried via chat.get (bot_count=0, user_count=0).
+        #
+        # Workaround: detect `oc_` prefix P2P chat IDs, resolve the user's
+        # open_id from the chat's owner, and send via `receive_id_type=open_id`
+        # instead.  Feishu auto-creates the P2P DM when the bot sends a direct
+        # message to a user by open_id.
+        #
+        # We bypass adapter.send() in this case and use the Lark client
+        # directly with the corrected receive_id_type.
+        # ------------------------------------------------------------------ #
+        is_oc_chat = str(chat_id).startswith("oc_")
+        resolved_user_open_id = None
+
+        if is_oc_chat:
+            try:
+                from lark_oapi.api.im.v1 import GetChatRequest
+                get_req = GetChatRequest.builder().chat_id(str(chat_id)).build()
+                get_resp = await asyncio.to_thread(adapter._client.im.v1.chat.get, get_req)
+                if getattr(get_resp, "code", -1) == 0:
+                    data = getattr(get_resp, "data", None)
+                    if data:
+                        owner_id = getattr(data, "owner_id", None)
+                        owner_id_type = getattr(data, "owner_id_type", None)
+                        if owner_id and owner_id_type == "open_id":
+                            resolved_user_open_id = owner_id
+            except Exception as exc:
+                logger.debug(
+                    "[Feishu] Failed to resolve open_id for oc_chat %s: %s",
+                    chat_id, exc,
+                )
+
         last_result = None
         if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
+            if is_oc_chat and resolved_user_open_id:
+                # Use open_id addressing — sends as a fresh P2P DM that Feishu
+                # pushes to the user's client even when the bot app isn't in
+                # the chat's member list.
+                last_result = await _send_feishu_direct(
+                    adapter, chat_id, message, metadata,
+                    receive_id_type="open_id",
+                    receive_id=resolved_user_open_id,
+                )
+            else:
+                last_result = await adapter.send(chat_id, message, metadata=metadata)
             if not last_result.success:
                 return _error(f"Feishu send failed: {last_result.error}")
 
@@ -1407,6 +1455,89 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         }
     except Exception as e:
         return _error(f"Feishu send failed: {e}")
+
+
+async def _send_feishu_direct(
+    adapter,
+    chat_id: str,
+    message: str,
+    metadata: dict | None,
+    receive_id_type: str,
+    receive_id: str,
+) -> Any:
+    """Send a Feishu message directly via the Lark client with a custom receive_id_type.
+
+    This bypasses ``adapter.send()`` which always uses ``receive_id_type=chat_id``.
+    Used by ``_send_feishu`` for ``oc_`` P2P chats where the bot app isn't in the
+    chat's member list, and ``receive_id_type=open_id`` is needed instead.
+    """
+    from gateway.platforms.feishu import (
+        _build_markdown_post_payload,
+        _strip_markdown_to_plain_text,
+    )
+    from gateway.platforms.base import SendResult
+
+    try:
+        from lark_oapi.api.im.v1 import (
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+    except ImportError:
+        return SendResult(success=False, error="lark-oapi not available")
+
+    formatted = adapter.format_message(message)
+
+    # Generate a unique ID for idempotency (avoids uuid import in standalone path)
+    _send_ts_ns = int(time.time() * 1_000_000)
+
+    # Try post (rich markdown) first, fall back to plain text
+    payload = _build_markdown_post_payload(formatted)
+    content_str = json.dumps(payload, ensure_ascii=False)
+
+    # Build the post payload
+    body = (
+        CreateMessageRequestBody.builder()
+        .receive_id(receive_id)
+        .msg_type("post")
+        .content(content_str)
+        .uuid(str(_send_ts_ns))
+        .build()
+    )
+    request = CreateMessageRequest.builder().receive_id_type(receive_id_type).request_body(body).build()
+
+    try:
+        response = await asyncio.to_thread(adapter._client.im.v1.message.create, request)
+        if getattr(response, "code", -1) == 0:
+            data = getattr(response, "data", None)
+            msg_id = None
+            if data:
+                msg_id = getattr(data, "message_id", None)
+            return SendResult(success=True, message_id=msg_id, raw_response=response)
+        else:
+            err_code = getattr(response, "code", "?")
+            err_msg = getattr(response, "msg", "?")
+            # Fall back to plain text if post content is rejected
+            if err_code == 10003 or "invalid" in str(err_msg).lower():
+                fallback_text = json.dumps({"text": _strip_markdown_to_plain_text(formatted)}, ensure_ascii=False)
+                fallback_body = (
+                    CreateMessageRequestBody.builder()
+                    .receive_id(receive_id)
+                    .msg_type("text")
+                    .content(fallback_text)
+                    .uuid(str(_send_ts_ns + 1))
+                    .build()
+                )
+                fallback_request = CreateMessageRequest.builder().receive_id_type(receive_id_type).request_body(fallback_body).build()
+                fallback_response = await asyncio.to_thread(adapter._client.im.v1.message.create, fallback_request)
+                if getattr(fallback_response, "code", -1) == 0:
+                    fallback_data = getattr(fallback_response, "data", None)
+                    fallback_msg_id = None
+                    if fallback_data:
+                        fallback_msg_id = getattr(fallback_data, "message_id", None)
+                    return SendResult(success=True, message_id=fallback_msg_id, raw_response=fallback_response)
+            return SendResult(success=False, error=f"[{err_code}] {err_msg}", raw_response=response)
+    except Exception as exc:
+        return SendResult(success=False, error=str(exc))
 
 
 def _check_send_message():
